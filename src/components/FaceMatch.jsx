@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import * as faceapi from 'face-api.js';
-import * as tf from '@tensorflow/tfjs';
 import {
   AlertCircle,
   Database,
+  Folder,
   ImagePlus,
   LoaderCircle,
   RefreshCw,
@@ -25,17 +25,25 @@ const createImageElement = (src) =>
   });
 
 const getFaceDescriptor = async (imageSource) => {
-  const image =
-    typeof imageSource === 'string'
-      ? await createImageElement(imageSource)
-      : await faceapi.bufferToImage(imageSource);
+  try {
+    const image =
+      typeof imageSource === 'string'
+        ? await createImageElement(imageSource)
+        : await faceapi.bufferToImage(imageSource);
 
-  const detection = await faceapi
-    .detectSingleFace(image, new faceapi.TinyFaceDetectorOptions())
-    .withFaceLandmarks()
-    .withFaceDescriptor();
+    // Add a small delay to ensure TensorFlow.js backend is ready
+    await new Promise(resolve => setTimeout(resolve, 100));
 
-  return detection?.descriptor ?? null;
+    const detection = await faceapi
+      .detectSingleFace(image, new faceapi.TinyFaceDetectorOptions())
+      .withFaceLandmarks()
+      .withFaceDescriptor();
+
+    return detection?.descriptor ?? null;
+  } catch (error) {
+    console.error('Face detection failed:', error);
+    throw new Error(`Face detection error: ${error.message}`);
+  }
 };
 
 const FaceMatch = () => {
@@ -60,31 +68,59 @@ const FaceMatch = () => {
       setError('');
 
       try {
-        // Set backend priority with fallback
-        try {
-          await tf.setBackend('webgl');
-        } catch (e) {
-          console.warn('WebGL backend not available, falling back to CPU', e);
-          await tf.setBackend('cpu');
+        // Check browser compatibility first
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+        if (!gl) {
+          throw new Error('WebGL is not supported in this browser. Face recognition requires WebGL acceleration. Try using Chrome, Firefox, or Safari.');
         }
 
-        // Wait for backend to be ready
-        await tf.ready();
-        console.log('TensorFlow.js backend initialized:', tf.getBackend());
+        console.log('✓ WebGL is supported');
+
+        // Try to access and configure face-api.js's internal TensorFlow.js
+        if (faceapi.tf && faceapi.tf.setBackend) {
+          try {
+            await faceapi.tf.setBackend('webgl');
+            await faceapi.tf.ready();
+            console.log('✓ TensorFlow.js backend:', faceapi.tf.getBackend());
+          } catch (backendError) {
+            console.warn('WebGL backend setup failed, will use default:', backendError);
+          }
+        } else {
+          console.warn('Cannot access face-api.js TensorFlow instance directly');
+        }
 
         const modelUrl = '/models';
-        await Promise.all([
-          faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl),
-          faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl),
-          faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl),
-        ]);
+
+        // Load models with individual error handling
+        try {
+          await faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl);
+          console.log('✓ TinyFaceDetector loaded');
+        } catch (err) {
+          throw new Error(`Failed to load TinyFaceDetector: ${err.message}`);
+        }
+
+        try {
+          await faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl);
+          console.log('✓ FaceLandmark68Net loaded');
+        } catch (err) {
+          throw new Error(`Failed to load FaceLandmark68Net: ${err.message}`);
+        }
+
+        try {
+          await faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl);
+          console.log('✓ FaceRecognitionNet loaded');
+        } catch (err) {
+          throw new Error(`Failed to load FaceRecognitionNet: ${err.message}`);
+        }
 
         setModelsReady(true);
         setStatusMessage('Models loaded. Fetching and indexing database faces...');
       } catch (loadError) {
         console.error('Model loading failed:', loadError);
-        setError('Unable to load face-recognition models from /public/models.');
-        setStatusMessage('Model load failed.');
+        setError(`Unable to load face-recognition models: ${loadError.message}`);
+        setStatusMessage('Model load failed. Check console for details.');
       } finally {
         setLoadingModels(false);
       }
@@ -158,11 +194,11 @@ const FaceMatch = () => {
     fetchDatabaseImages();
   }, [fetchDatabaseImages, modelsReady]);
 
-  const handleDatabaseUpload = async (event) => {
-    const file = event.target.files?.[0];
+  const handleDatabaseUpload = async (event, isFolder = false) => {
+    const files = Array.from(event.target.files || []);
     event.target.value = '';
 
-    if (!file) {
+    if (!files.length) {
       return;
     }
 
@@ -170,22 +206,57 @@ const FaceMatch = () => {
     setError('');
 
     try {
-      const formData = new FormData();
-      formData.append('image', file);
+      let successCount = 0;
+      let failCount = 0;
+      const totalFiles = files.length;
 
-      const response = await fetch(`${API_BASE_URL}/api/v1/face/upload`, {
-        method: 'POST',
-        body: formData,
-      });
+      setStatusMessage(
+        `Uploading ${totalFiles} image${totalFiles > 1 ? 's' : ''}... (0/${totalFiles})`
+      );
 
-      if (!response.ok) {
-        throw new Error('Failed to upload database image');
+      // Upload files sequentially to avoid overwhelming the server
+      for (let i = 0; i < files.length; i++) {
+        try {
+          const formData = new FormData();
+          formData.append('image', files[i]);
+
+          const response = await fetch(`${API_BASE_URL}/api/v1/face/upload`, {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (response.ok) {
+            successCount++;
+          } else {
+            failCount++;
+            console.warn(`Failed to upload ${files[i].name}`);
+          }
+
+          setStatusMessage(
+            `Uploading ${totalFiles} image${totalFiles > 1 ? 's' : ''}... (${i + 1}/${totalFiles})`
+          );
+        } catch (fileError) {
+          failCount++;
+          console.warn(`Error uploading ${files[i].name}:`, fileError);
+        }
       }
 
+      // Refresh database after all uploads complete
       await fetchDatabaseImages();
+
+      // Show upload summary
+      if (failCount === 0) {
+        setStatusMessage(
+          `Successfully uploaded ${successCount} image${successCount > 1 ? 's' : ''} to database.`
+        );
+      } else {
+        setError(
+          `Uploaded ${successCount}/${totalFiles} images. ${failCount} failed.`
+        );
+      }
     } catch (uploadError) {
       console.error('Upload failed:', uploadError);
-      setError('Unable to upload image into the face database.');
+      setError('Unable to upload images to the face database.');
     } finally {
       setUploadingDatabaseImage(false);
     }
@@ -299,26 +370,72 @@ const FaceMatch = () => {
               </div>
 
               {error && (
-                <div className="flex items-start gap-2 text-sm text-red-300 bg-red-500/10 p-3 rounded-lg border border-red-500/20">
-                  <AlertCircle size={16} className="mt-0.5 shrink-0" />
-                  <span>{error}</span>
-                </div>
+                <>
+                  <div className="flex items-start gap-2 text-sm text-red-300 bg-red-500/10 p-3 rounded-lg border border-red-500/20">
+                    <AlertCircle size={16} className="mt-0.5 shrink-0" />
+                    <span>{error}</span>
+                  </div>
+
+                  {error.includes('WebGL') || error.includes('TensorFlow') || error.includes('backend') ? (
+                    <div className="text-xs text-[#777] bg-black/20 p-3 rounded-lg border border-[#1F2227]">
+                      <p className="font-semibold text-[#999] mb-2">Troubleshooting steps:</p>
+                      <ul className="space-y-1 list-disc list-inside">
+                        <li>Try refreshing the page</li>
+                        <li>Use Chrome, Firefox, or Safari (latest versions)</li>
+                        <li>Check if hardware acceleration is enabled in browser</li>
+                        <li>Try a different device if the issue persists</li>
+                        <li>Clear browser cache and reload</li>
+                      </ul>
+                    </div>
+                  ) : null}
+                </>
               )}
 
-              <label className="block">
+              <div>
                 <span className="text-xs font-mono text-[#555] uppercase tracking-widest mb-3 block">Add To Database</span>
-                <span className="w-full py-4 px-4 rounded-xl border border-dashed border-[#2B3138] bg-black/20 hover:border-[#0078D4]/60 transition-colors flex items-center justify-center gap-3 cursor-pointer">
-                  <Upload size={18} className="text-[#0078D4]" />
-                  {uploadingDatabaseImage ? 'Uploading...' : 'Upload database face'}
-                </span>
-                <input
-                  type="file"
-                  accept="image/png,image/jpeg,image/jpg,image/webp"
-                  className="hidden"
-                  onChange={handleDatabaseUpload}
-                  disabled={uploadingDatabaseImage || loadingModels}
-                />
-              </label>
+                <div className="grid grid-cols-2 gap-2">
+                  {/* Single/Multiple Files Upload */}
+                  <label className="block">
+                    <span className="w-full py-3 px-3 rounded-xl border border-dashed border-[#2B3138] bg-black/20 hover:border-[#0078D4]/60 transition-colors flex items-center justify-center gap-2 cursor-pointer">
+                      <Upload size={16} className="text-[#0078D4]" />
+                      <span className="text-sm">
+                        {uploadingDatabaseImage ? 'Uploading...' : 'Add Images'}
+                      </span>
+                    </span>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/jpg,image/webp"
+                      multiple
+                      className="hidden"
+                      onChange={(e) => handleDatabaseUpload(e, false)}
+                      disabled={uploadingDatabaseImage || loadingModels}
+                    />
+                  </label>
+
+                  {/* Folder Upload */}
+                  <label className="block">
+                    <span className="w-full py-3 px-3 rounded-xl border border-dashed border-[#2B3138] bg-black/20 hover:border-[#0078D4]/60 transition-colors flex items-center justify-center gap-2 cursor-pointer">
+                      <Folder size={16} className="text-[#0078D4]" />
+                      <span className="text-sm">
+                        {uploadingDatabaseImage ? 'Uploading...' : 'Add Folder'}
+                      </span>
+                    </span>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/jpg,image/webp"
+                      webkitdirectory
+                      directory
+                      multiple
+                      className="hidden"
+                      onChange={(e) => handleDatabaseUpload(e, true)}
+                      disabled={uploadingDatabaseImage || loadingModels}
+                    />
+                  </label>
+                </div>
+                <p className="text-xs text-[#555] mt-2">
+                  Select multiple images or an entire folder to bulk upload
+                </p>
+              </div>
 
               <label className="block">
                 <span className="text-xs font-mono text-[#555] uppercase tracking-widest mb-3 block">Compare Sample</span>

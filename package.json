@@ -10,7 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@tensorflow/tfjs": "^4.22.0",
     "face-api.js": "^0.22.2",
     "lucide-react": "^0.562.0",
     "react": "^19.2.0",
